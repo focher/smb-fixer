@@ -1,0 +1,29 @@
+# Secrets / local config
+.env
+.env.*
+*.env
+!.env.example
+smbfixer.toml
+
+# Local tooling
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Diagnostic output (may contain hostnames, usernames, logs)
+reports/
+captures/
+
+# macOS
+.DS_Store
