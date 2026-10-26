@@ -231,6 +231,15 @@ def build_facts(snap: Snapshot) -> Facts:
         year = datetime.fromtimestamp(snap.created_at).year
         host_events = logs.classify_samba(ps.samba_log(snap.out("host", "samba_log")))
         host_events += logs.classify_syslog(ps.syslog(snap.out("host", "syslog"), year))
+        # Unraid sends smbd messages to both log.smbd and syslog; keep one copy of each.
+        seen, unique = set(), []
+        for e in host_events:
+            key = (e.when.replace(microsecond=0) if e.when else None, e.kind, e.message.split(":", 1)[-1][:80])
+            if e.kind and key in seen:
+                continue
+            seen.add(key)
+            unique.append(e)
+        host_events = unique
         # host wall clock -> client wall clock: undo the time-zone difference and the clock skew
         tz_diff = (f.host_tz - f.client_tz) if f.host_tz is not None and f.client_tz is not None else timedelta()
         f.host_events = align(host_events, tz_diff + timedelta(seconds=f.clock_skew or 0.0))

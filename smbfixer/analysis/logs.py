@@ -16,10 +16,14 @@ CLIENT_PATTERNS = [
     ("timemachine", re.compile(r"TM Read - attributes|Attempt setting durable handle timeout", re.I)),
     ("durable", re.compile(r"Durable Handle V2 or Persistent Handles not supported|failed to set Durable Handle", re.I)),
     ("dead", re.compile(r"is dead, give up", re.I)),
+    # After a reconnect the Mac could not reclaim an open file: the copy or save using it fails.
+    ("durable_lost", re.compile(r"Could not reopen durable handle|reconnect_dur_handle failed", re.I)),
     ("io_failed", re.compile(r"(?:READ|WRITE) failed with an error|read_write_async failed", re.I)),
     ("disconnect", re.compile(r"Server closed their side of the connection|connection (?:reset|lost)|broken pipe|"
                               r"ECONNRESET", re.I)),
-    ("timeout", re.compile(r"ts > iod_lastrecv|timed? ?out|not responding", re.I)),
+    # TRAN_SEND error 35 (EAGAIN): the Mac could not hand data to the server; it reconnects right after.
+    ("timeout", re.compile(r"ts > iod_lastrecv|TRAN_SEND returned non-fatal error 35|timed? ?out|not responding",
+                           re.I)),
     # One line every couple of seconds while a session keeps retrying; used for loop detection.
     ("reconnect_retry", re.compile(r"smb_iod_start_reconnect", re.I)),
     ("reconnect", re.compile(r"Starting reconnect|negotiate succeeded|Reconnect succeeded|reconnect", re.I)),
@@ -30,6 +34,8 @@ CLIENT_PATTERNS = [
 SESSION_ID = re.compile(r"\b(?:id|iod) (\d+)\b")
 
 SAMBA_PATTERNS = [
+    ("durable_lost", re.compile(r"durable_reconnect\S*: .*failed", re.I)),
+    ("sendfile", re.compile(r"sendfile failed", re.I)),
     ("disconnect", re.compile(r"NT_STATUS_CONNECTION_(?:RESET|DISCONNECTED)|Connection reset by peer|"
                               r"read_fd_with_timeout|client \S+ (?:disconnected|went away)", re.I)),
     ("timeout", re.compile(r"NT_STATUS_IO_TIMEOUT|timed out|Timeout waiting", re.I)),
@@ -53,9 +59,10 @@ SYSLOG_PATTERNS = [
 ]
 
 # Client-side kinds that indicate the user saw a hang or a dropped connection.
-TROUBLE = {"reconnect", "timeout", "disconnect", "dead", "io_failed"}
+TROUBLE = {"reconnect", "timeout", "disconnect", "dead", "io_failed", "durable_lost"}
 # Host-side kinds that commonly cause client hangs.
-CAUSES = {"spinup", "nic", "io_error", "oom", "crash", "disconnect", "timeout", "resource", "oplock", "shfs"}
+CAUSES = {"spinup", "nic", "io_error", "oom", "crash", "disconnect", "timeout", "resource", "oplock", "shfs",
+          "sendfile", "durable_lost"}
 
 
 def classify(event: LogEvent, patterns) -> LogEvent:
@@ -118,7 +125,8 @@ class Episode:
         k = self.kinds
         parts = [f"{k[n]} {label}" for n, label in (
             ("timeout", "stalls"), ("disconnect", "server disconnects"), ("reconnect", "reconnects"),
-            ("io_failed", "failed reads/writes"), ("dead", "session gave up")) if n in k]
+            ("io_failed", "failed reads/writes"), ("durable_lost", "open files lost"),
+            ("dead", "session gave up")) if n in k]
         span = f"{self.start:%H:%M:%S}" + (f"–{self.end:%H:%M:%S} ({self.seconds:.0f}s)" if self.seconds >= 1 else "")
         return f"{span}: {', '.join(parts)}"
 

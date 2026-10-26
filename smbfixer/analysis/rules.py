@@ -6,6 +6,7 @@ safety or compatibility for speed say so in `tradeoff`.
 
 from __future__ import annotations
 
+import re
 import shlex
 from datetime import timedelta
 
@@ -426,7 +427,7 @@ def lockup_episodes(f: Facts):
         return
     boot = f.host_boot
     restart = [e for e in eps if boot and boot - timedelta(minutes=15) <= e.start <= boot + timedelta(minutes=2)]
-    severe = [e for e in eps if {"dead", "io_failed"} & e.kinds.keys() and e not in restart]
+    severe = [e for e in eps if {"dead", "io_failed", "durable_lost"} & e.kinds.keys() and e not in restart]
     worst = max(eps, key=lambda e: (len(e.events), e.seconds))
     ev = [e.describe() + ("  (server was restarting)" if e in restart else "")
           for e in sorted(eps, key=lambda e: e.start)[-8:]]
@@ -536,18 +537,15 @@ def time_machine(f: Facts):
         return
     tm_share = next((name for name, sec in f.smbconf.items()
                      if (sec.get("fruit:time machine") or "").lower() == "yes"), "")
-    section = tm_share or "<time machine share>"
-    params = {"durable handles": "yes", "kernel oplocks": "no", "kernel share modes": "no", "posix locking": "no"}
+    params = {k: v for k, v in DURABLE_PREREQS.items()}
     if f.smbconf:
         sec = f.smbconf.get(tm_share, {}) if tm_share else {}
         eff = lambda k: (sec.get(k) or f.smb_global.get(k) or "").lower()  # noqa: E731
         params = {k: v for k, v in params.items() if eff(k) != v}
     recs = [Recommendation(HOST_UI, "Shares > <time machine share> > SMB Security Settings > Export: Yes (Time Machine)",
                            "Unraid then adds the fruit Time Machine options for that share.")] if not tm_share else []
-    recs += [extra(k, v, "Durable handles need these on the Time Machine share.", section=section,
-                   tradeoff="posix locking/kernel share modes = no hide SMB locks from local Linux processes "
-                            "and NFS; fine for a share used only by Time Machine." if k != "durable handles" else "")
-             for k, v in params.items()]
+    if params:
+        recs += durable_fixes(f, params, "Durable handles need these; set server-wide so every share gets them.")
     last = max(e.when for e in durable if e.when) if any(e.when for e in durable) else None
     if f.smbconf and tm_share and not params and (f.host_boot is None or (last and last < f.host_boot)):
         # The config is right now; the refusals in the log are from before it was applied.
@@ -767,6 +765,82 @@ def oplocks_leases(f: Facts):
              for k, _ in issues],
             [restore(f, k, good, "Allow the client to cache safely.") for k, good in issues],
         )
+
+
+DURABLE_PREREQS = {"durable handles": "yes", "kernel oplocks": "no", "kernel share modes": "no", "posix locking": "no"}
+POSIX_TRADEOFF = ("SMB byte-range locks are no longer mirrored to programs running on the server itself "
+                  "(Docker containers, scripts) or to NFS clients, and vice versa.")
+
+
+def durable_fixes(f: Facts, unmet: dict[str, str], why: str) -> list[Recommendation]:
+    """Server-wide settings for the unmet durable-handle prerequisites, plus cleanup of per-share copies."""
+    recs = [extra(key, DURABLE_PREREQS[key], why, tradeoff=POSIX_TRADEOFF if key == "posix locking" else "")
+            for key in DURABLE_PREREQS if key in unmet]
+    # Per-share sections in smb-extra.conf are parsed before Unraid defines the shares
+    # ("No path in service ... making it unavailable"); once [global] covers it they are redundant.
+    for section, values in f.smb_extra.items():
+        if section.lower() != "global":
+            for key in DURABLE_PREREQS:
+                if key in values:
+                    recs.append(drop(key, "Covered by the [global] setting.", section=section))
+    return recs
+
+
+@rule
+def durable_unavailable(f: Facts):
+    lost_client = [e for e in f.client_events if e.kind == "durable_lost"]
+    lost_host = [e for e in f.host_events if e.kind == "durable_lost"]
+    if not lost_client and not lost_host:
+        return
+    unmet = {k: f.smb_param(k) for k, v in DURABLE_PREREQS.items() if (f.smb_param(k) or "").lower() != v}
+    files = sorted({m.group(1) for e in lost_client
+                    if (m := re.search(r"(?:handle for|on <)\s*<?([^<>]+?)>?\s*$", e.message))})
+    yield Finding(
+        "host.durable_unavailable", "critical" if unmet else "warning", "host",
+        f"Open files are lost when the connection drops ({len(lost_client) or len(lost_host)} time(s))",
+        "After a reconnect the Mac asks the server to hand back the files it had open (a durable handle). "
+        "The server refused, so the copy or save in progress fails with an error instead of carrying on. "
+        + (f"Samba only grants durable handles when {', '.join(f'{k} = {v}' for k, v in DURABLE_PREREQS.items())}; "
+           f"[{f.share_name or 'global'}] has {', '.join(f'{k} = {v}' for k, v in unmet.items())}."
+           if unmet else "The durable-handle settings look right, so the handle may have expired first."),
+        [f"file: {name}" for name in files[:4]] + logs.samples(f.client_events, "durable_lost", 2)
+        + logs.samples(f.host_events, "durable_lost", 2),
+        durable_fixes(f, unmet, "Lets Samba grant durable handles so open files survive a reconnect.") if unmet else [],
+    )
+
+
+@rule
+def synchronous_io(f: Facts):
+    if not f.smb_global:
+        return
+    aio_off = [k for k in ("aio read size", "aio write size") if (f.smb_global.get(k) or "1").strip() == "0"]
+    sendfile = (f.smb_global.get("use sendfile") or "no").lower() == "yes"
+    if not aio_off:
+        return
+    stalls = [e for e in f.client_events if e.kind == "timeout" and "TRAN_SEND" in e.message]
+    sendfile_fail = [e for e in f.host_events if e.kind == "sendfile"]
+    seen = bool(stalls or sendfile_fail)
+    recs = [extra(k, "1", "Do disk I/O in background threads so one slow read or write does not block the "
+                          "whole connection.",
+                  tradeoff="Overrides Unraid's shipped default (its smb.conf turns async I/O off); delete these "
+                           "lines from SMB Extras to go back.")
+            for k in aio_off]
+    if sendfile:
+        recs.append(extra("use sendfile", "no", "sendfile runs inside the connection's main process and blocks "
+                                               "it for the whole read.",
+                          tradeoff="Slightly more CPU per read; overrides Unraid's shipped default."))
+    yield Finding(
+        "host.synchronous_io", "critical" if seen else "warning", "host",
+        "Samba handles each connection's disk I/O one request at a time",
+        "Unraid ships with async I/O off" + (" and sendfile on" if sendfile else "") + ". A Mac uses one SMB "
+        "connection for everything it does with a share, so a slow write to the parity array (or a read from a "
+        "disk that is spinning up) freezes every other transfer on that connection. When the freeze lasts a few "
+        "seconds the Mac cannot send (error 35), drops the connection and reconnects, and copies in progress fail."
+        + (f" This happened {len(stalls) or len(sendfile_fail)} time(s) in the collected logs." if seen else ""),
+        [f"{k} = 0" for k in aio_off] + (["use sendfile = Yes"] if sendfile else [])
+        + logs.samples(f.client_events, "timeout", 2) + logs.samples(f.host_events, "sendfile", 1),
+        recs,
+    )
 
 
 # vfs_fruit options documented in the Samba manual page.
