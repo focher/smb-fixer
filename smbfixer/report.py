@@ -35,10 +35,17 @@ def ini_snippet(recs: list[Recommendation], existing: dict[str, dict[str, str]] 
     for name, values in (existing or {}).items():
         sections[name] = dict(values)
     for r in recs:
+        section = sections.setdefault(r.section or "global", {})
+        if r.remove_key:
+            for k in [k for k in section if k.lower() == r.remove_key.lower()]:
+                del section[k]
+            continue
         key, _, value = r.action.partition("=")
-        sections.setdefault(r.section or "global", {})[key.strip()] = value.strip()
+        section[key.strip()] = value.strip()
     lines = []
     for name, values in sections.items():
+        if not values:
+            continue
         lines.append(f"[{name}]")
         lines += [f"{k}{sep}{v}" for k, v in values.items()]
         lines.append("")

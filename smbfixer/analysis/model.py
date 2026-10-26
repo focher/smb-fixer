@@ -20,6 +20,7 @@ class Recommendation:
     why: str = ""
     section: str = ""  # config section, e.g. "default", "global", or a share name
     tradeoff: str = ""  # set when the change trades safety/compatibility for speed
+    remove_key: str = ""  # set when the fix is deleting an existing line rather than setting a value
 
     @property
     def side(self) -> str:

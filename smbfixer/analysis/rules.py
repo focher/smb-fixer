@@ -6,6 +6,9 @@ safety or compatibility for speed say so in `tradeoff`.
 
 from __future__ import annotations
 
+import shlex
+from datetime import timedelta
+
 from smbfixer.analysis import logs
 from smbfixer.analysis.facts import Facts
 from smbfixer.analysis.model import (
@@ -35,6 +38,25 @@ def nsmb(key, value, why, tradeoff=""):
 
 def extra(key, value, why, section="global", tradeoff=""):
     return Recommendation(HOST_SMB_EXTRA, f"{key} = {value}", why, section=section, tradeoff=tradeoff)
+
+
+def drop(key, why, section="global", tradeoff=""):
+    return Recommendation(HOST_SMB_EXTRA, f"delete the '{key}' line", why, section=section, tradeoff=tradeoff,
+                          remove_key=key)
+
+
+def in_extra(f: Facts, key: str, section: str = "global") -> str | None:
+    """Value of `key` in smb-extra.conf, if the user (not Unraid) set it there."""
+    sec = next((v for k, v in f.smb_extra.items() if k.lower() == section.lower()), {})
+    return sec.get(key.lower())
+
+
+def restore(f: Facts, key: str, good: str, why: str, tradeoff: str = "") -> Recommendation:
+    """Fix a bad value: delete it from smb-extra.conf if it was set there, otherwise set the good value."""
+    if in_extra(f, key) is not None:
+        return drop(key, why + f" Samba's default is {good}.", tradeoff=tradeoff)
+    section = f.share_name if key.lower() in f.share_conf else "global"
+    return extra(key, good, why, section=section, tradeoff=tradeoff)
 
 
 # --------------------------------------------------------------------------- network
@@ -114,6 +136,51 @@ def mtu(f: Facts):
             [Recommendation(NETWORK, f"Set the same MTU on both ends (both 1500, or both 9000 if the switch supports it)",
                             "Consistent MTU avoids silent drops of large SMB frames.")],
         )
+
+
+@rule
+def host_shim_route(f: Facts):
+    """The host's route to the client leaves via a macvlan/ipvlan sub-interface (Docker host access)."""
+    dev = f.host_route.get("dev") or ""
+    info = f.host_ifaces.get(dev, {})
+    kind = info.get("kind") or ""
+    # Bridges, bonds and 802.1Q VLANs also have lower devices; only macvlan/ipvlan shims are suspect.
+    if kind and kind not in {"macvlan", "ipvlan"}:
+        return
+    if not kind and not ps.is_shim_name(dev):
+        return
+    parent = ps.parent_device(f.host_ifaces, dev)
+    host_ip = f.snap.meta.get("host_ip", "")
+    ev = [f"route to {f.host_route.get('client_ip')}: dev {dev}"
+          + (f" (src {f.host_route['src']})" if f.host_route.get("src") else "")
+          + (f", {kind}" if kind else "") + (f" on {parent}" if parent else "")]
+    for r in [r for r in f.host_routes if r.get("dev") in {dev, parent}]:
+        ev.append(f"route {r.get('dst')} dev {r.get('dev')} metric {r.get('metric', 0)}")
+    if info.get("tx_queues"):
+        ev.append(f"{dev}: {info['tx_queues']} transmit queue(s)")
+    holders = f.host_addrs.get(host_ip, [])
+    if len(holders) > 1:
+        ev.append(f"{host_ip} is assigned to {', '.join(holders)}")
+    yield Finding(
+        "network.host_shim_route", "warning", "network",
+        f"Host answers this Mac through {dev}, a sub-interface of {parent or 'the bridge'}",
+        f"Replies to the Mac do not leave through {parent or 'the main bridge'} directly but through a "
+        f"{kind or 'macvlan'} device that Unraid creates for Docker's 'Host access to custom networks'. "
+        "Its route wins because it has a lower metric than the bridge's own route. This adds a virtual hop "
+        "to every SMB reply, and macvlan on Unraid has a history of kernel call traces and network drops "
+        "(Unraid recommends ipvlan for custom networks). Worth ruling out if lockups continue.",
+        ev,
+        [Recommendation(HOST_UI, "Settings > Docker (Enable Docker: No to edit) > Docker custom network type: ipvlan",
+                        "Avoids macvlan on the host's own network path.",
+                        tradeoff="With ipvlan, containers on the custom network share the host's MAC address; "
+                                 "routers doing MAC-based DHCP reservations see one MAC."),
+         Recommendation(HOST_UI, "...or set 'Host access to custom networks: Disabled' if you do not need it",
+                        "Removes the shim interface and its competing route.",
+                        tradeoff="The server and containers with their own IPs can no longer reach each other "
+                                 "directly."),
+         Recommendation(HOST_SHELL, f"ip route get {f.host_route.get('client_ip')} from {host_ip}",
+                        f"After the change this should show dev {parent or 'br0'}.")],
+    )
 
 
 @rule
@@ -355,20 +422,85 @@ def lockup_episodes(f: Facts):
     eps = f.episodes
     if not eps:
         return
-    severe = [e for e in eps if {"dead", "io_failed"} & e.kinds.keys()]
+    boot = f.host_boot
+    restart = [e for e in eps if boot and boot - timedelta(minutes=15) <= e.start <= boot + timedelta(minutes=2)]
+    severe = [e for e in eps if {"dead", "io_failed"} & e.kinds.keys() and e not in restart]
     worst = max(eps, key=lambda e: (len(e.events), e.seconds))
-    ev = [e.describe() for e in sorted(eps, key=lambda e: e.start)[-8:]]
+    ev = [e.describe() + ("  (server was restarting)" if e in restart else "")
+          for e in sorted(eps, key=lambda e: e.start)[-8:]]
     setup = f.multichannel.get("setup_time")
     if setup:
         ev.append(f"current session for {f.multichannel.get('mount')} was set up at {setup}")
     yield Finding(
         "logs.episodes", "critical" if severe else "warning", "logs",
         f"{len(eps)} connection trouble episode(s) in the client log"
-        + (f"; {len(severe)} ended with failed I/O" if severe else ""),
+        + (f"; {len(severe)} ended with failed I/O" if severe else "")
+        + (f" ({len(restart)} explained by the server restart)" if restart else ""),
         "Each episode is a burst of stalls, server disconnects and reconnects: what the user sees as a hang. "
         + ("Failed reads/writes mean applications got errors, not just delays. " if severe else "")
-        + f"The worst lasted {worst.seconds:.0f}s with {len(worst.events)} events.",
+        + (f"The worst lasted {worst.seconds:.0f}s with {len(worst.events)} events." if worst.seconds >= 1
+           else f"The worst had {len(worst.events)} events."),
         ev,
+    )
+
+
+@rule
+def array_state(f: Facts):
+    state = f.array.get("mdState", "")
+    if state and state != "STARTED":
+        yield Finding(
+            "host.array_stopped", "critical", "host", f"The Unraid array is {state.lower()}: no shares are exported",
+            "Samba only exports user shares while the array is started, so the Mac cannot mount anything. "
+            "This is the normal state right after a reboot when auto-start is off.",
+            [f"mdState = {state}", f"fsState = {f.array.get('fsState', '?')}",
+             f"Samba sections: {', '.join(n for n in f.smbconf if n != 'global') or 'none besides [global]'}"],
+            [Recommendation(HOST_UI, "Main > Array Operation > Start", "Start the array to export shares."),
+             Recommendation(HOST_UI, "Settings > Disk Settings > Enable auto start: Yes",
+                            "Start the array automatically after a reboot.",
+                            tradeoff="With an encrypted array the passphrase still has to be entered.")],
+        )
+    pos = f.array.get("mdResyncPos", "0")
+    if pos.isdigit() and int(pos) > 0:
+        yield Finding(
+            "storage.resync", "warning", "storage",
+            f"A parity {f.array.get('mdResyncAction', 'check/sync').lower()} is running",
+            "While parity runs every array disk is busy; SMB reads and writes to the array are much slower and "
+            "Finder may stall.",
+            [f"mdResyncPos = {pos}", f"mdResync = {f.array.get('mdResync', '?')}"],
+            [Recommendation(HOST_UI, "Settings > Scheduler: run parity checks outside working hours",
+                            "Avoid overlapping parity with heavy SMB use.")],
+        )
+
+
+@rule
+def recent_boot(f: Facts):
+    if not f.host_boot:
+        return
+    up_min = float(f.snap.out("host", "uptime").split()[0]) / 60
+    if up_min > 24 * 60:
+        return
+    yield Finding(
+        "host.recent_boot", "info", "host", f"The server restarted at {f.host_boot:%Y-%m-%d %H:%M} ({up_min:.0f} min ago)",
+        "Client trouble just before this time is from the shutdown, and host counters and logs only cover "
+        "the time since boot.",
+        [f"host uptime {up_min:.0f} min"],
+    )
+
+
+@rule
+def idle_closes(f: Facts):
+    if not f.idle_closes:
+        return
+    tm = sorted(e.when for e in f.client_events if e.kind == "timemachine" and e.when)
+    after_tm = [ep for ep in f.idle_closes if any(0 <= (ep.start - t).total_seconds() <= 1800 for t in tm)]
+    yield Finding(
+        "logs.idle_closes", "info", "logs",
+        f"The server closed {len(f.idle_closes)} idle session(s)",
+        "Each was a single server-side close with no stall, failed I/O or reconnect storm around it: Samba "
+        "dropping a session nothing was using. macOS reconnects on next use, so this is normally harmless."
+        + (f" {len(after_tm)} came within 30 minutes of a Time Machine backup, which leaves its session idle "
+           "when it finishes." if after_tm else ""),
+        [f"{ep.start:%Y-%m-%d %H:%M:%S} session {', '.join(ep.sessions) or '?'}" for ep in f.idle_closes[-6:]],
     )
 
 
@@ -496,10 +628,14 @@ def mc_server_speed(f: Facts):
         detail = ("Samba reports this when it cannot read the speed of its interface (common on Unraid's br0 "
                   "bridge). macOS uses the advertised speed to decide how to spread multichannel traffic."
                   + (f" The host's physical NIC is {host_actual} Mb/s." if host_actual else ""))
-        recs = [extra("interfaces", f'"{f.snap.meta.get("host_ip") or "<host ip>"};speed={(host_actual or client) * 1000000}"',
-                      "Advertise the real link speed to SMB3 clients.",
-                      tradeoff="Unraid generates its own interface settings; check `testparm -s | grep interfaces` "
-                               "first and keep its interface list.")]
+        line = interfaces_with_speed(f.smb_global.get("interfaces", ""), f.snap.meta.get("host_ip", ""),
+                                     (host_actual or client) * 1_000_000)
+        recs = [extra("interfaces", line,
+                      "Advertise the real link speed to SMB3 clients; every other entry is kept as Unraid set it.",
+                      tradeoff="This pins a copy of Unraid's generated interface list. If the server's addresses "
+                               "change, update or delete this line.")] if line else []
+        if not line:
+            detail += " Could not find the host address in Samba's 'interfaces' list, so no change is proposed."
     yield Finding(
         "performance.mc_server_speed", "info", "performance",
         f"Server advertises {server} Mb/s to a {client} Mb/s client", detail,
@@ -507,6 +643,25 @@ def mc_server_speed(f: Facts):
         + ([f"host physical NIC {host_actual} Mb/s"] if host_actual else []),
         recs,
     )
+
+
+def interfaces_with_speed(current: str, host_ip: str, speed_bps: int) -> str | None:
+    """Return Samba's existing interfaces list with a speed option added to the host_ip entry."""
+    try:
+        entries = shlex.split(current)
+    except ValueError:
+        return None
+    if not host_ip or not entries:
+        return None
+    out, found = [], False
+    for entry in entries:
+        addr, _, opts = entry.partition(";")
+        if addr.split("/")[0] == host_ip:
+            found = True
+            options = [o for o in opts.split(",") if o and not o.startswith("speed=")]
+            entry = f"{addr};" + ",".join(options + [f"speed={speed_bps}"])
+        out.append(f'"{entry}"' if ";" in entry else entry)
+    return " ".join(out) if found else None
 
 
 # --------------------------------------------------------------------------- host
@@ -572,30 +727,71 @@ def socket_options(f: Facts):
         yield Finding(
             "host.socket_options", "warning", "host", "Samba socket buffers are pinned by 'socket options'",
             "Fixed SO_RCVBUF/SO_SNDBUF disables Linux TCP autotuning and usually lowers throughput on fast links. "
-            "The Samba docs advise leaving this unset.",
-            [f"socket options = {so}"],
-            [extra("socket options", "TCP_NODELAY", "Keep only TCP_NODELAY (or remove the line).")],
+            "Samba's own testparm warns about this setting.",
+            [f"socket options = {so}"]
+            + (["set in smb-extra.conf"] if in_extra(f, "socket options") is not None else []),
+            [restore(f, "socket options", "TCP_NODELAY", "Let the kernel size TCP buffers.")],
         )
 
 
 @rule
 def oplocks_leases(f: Facts):
-    issues = []
-    if (f.smb_param("oplocks") or "yes").lower() == "no":
-        issues.append(("oplocks", "yes"))
-    if (f.smb_param("smb2 leases") or "yes").lower() == "no":
-        issues.append(("smb2 leases", "yes"))
-    if (f.smb_param("kernel oplocks") or "no").lower() == "yes":
-        issues.append(("kernel oplocks", "no"))
+    checks = [("oplocks", "no", "yes"), ("level2 oplocks", "no", "yes"),
+              ("smb2 leases", "no", "yes"), ("kernel oplocks", "yes", "no")]
+    issues = [(k, good) for k, bad, good in checks if (f.smb_param(k) or good).lower() == bad]
     if issues:
+        names = {k for k, _ in issues}
         yield Finding(
             "host.oplocks", "warning", "host", "Client-side caching is restricted on the host",
-            "Disabling oplocks/leases forces the Mac to go to the server for every read and stat, which makes "
-            "browsing and app saves slow.",
-            [f"{k} is set to disable caching" for k, _ in issues],
-            [extra(k, v, "Allow the client to cache safely.",
-                   section=f.share_name if k in f.share_conf else "global") for k, v in issues],
+            "Disabling oplocks forces the Mac to go to the server for every read and stat, which makes browsing "
+            "and app saves slow."
+            + (" With 'oplocks = no' Samba also grants no SMB2 leases, even though 'smb2 leases' is on."
+               if "oplocks" in names and "smb2 leases" not in names else ""),
+            [f"{k} = {f.smb_param(k)}" + (" (set in smb-extra.conf)" if in_extra(f, k) is not None else "")
+             for k, _ in issues],
+            [restore(f, k, good, "Allow the client to cache safely.") for k, good in issues],
         )
+
+
+# vfs_fruit options documented in the Samba manual page.
+KNOWN_FRUIT = {
+    "aapl", "nfs_aces", "copyfile", "model", "posix_rename", "veto_appledouble", "zero_file_id",
+    "time machine", "time machine max size", "metadata", "resource", "locking", "encoding",
+    "wipe_intentionally_left_blank_rfork", "delete_empty_adfiles", "convert_adouble",
+}
+
+
+@rule
+def legacy_tweaks(f: Facts):
+    """Settings in smb-extra.conf that come from old tuning guides and hurt current macOS/Samba."""
+    if not f.smb_extra:
+        return
+    ev, recs = [], []
+    if (in_extra(f, "ea support") or "").lower() == "no":
+        ev.append("ea support = no")
+        recs.append(drop("ea support", "The fruit + streams_xattr setup that Unraid uses for Macs keeps Finder "
+                                       "info and resource forks in extended attributes; Samba's default is yes."))
+    meta = in_extra(f, "fruit:metadata")
+    share_meta = f.share_conf.get("fruit:metadata")
+    if meta and share_meta and meta.lower() != share_meta.lower():
+        ev.append(f"global fruit:metadata = {meta}, but [{f.share_name}] uses {share_meta}")
+        recs.append(drop("fruit:metadata", "Unraid sets this per share; a different global value only makes "
+                                           "shares disagree about where Mac metadata is stored."))
+    for key in in_extra_keys(f):
+        if key.startswith("fruit:") and key[len("fruit:"):] not in KNOWN_FRUIT:
+            ev.append(f"{key} = {in_extra(f, key)} (not a documented vfs_fruit option)")
+            recs.append(drop(key, "Samba ignores unknown fruit options silently; this one does nothing."))
+    if ev:
+        yield Finding(
+            "host.legacy_tweaks", "warning", "host", "smb-extra.conf contains outdated or conflicting tweaks",
+            "These lines are common in old Samba-for-Mac tuning posts. On current Samba they either undo "
+            "defaults that macOS relies on or have no effect.",
+            ev, recs,
+        )
+
+
+def in_extra_keys(f: Facts) -> list[str]:
+    return list(next((v for k, v in f.smb_extra.items() if k.lower() == "global"), {}))
 
 
 @rule
@@ -661,6 +857,8 @@ def spindown(f: Facts):
     use_cache = f.share_cfg.get("shareUseCache", "")
     delay = f.disk_cfg.get("spindownDelay", "")
     if not f.share_cfg or use_cache == "only" or delay in {"", "0"}:
+        return
+    if f.array.get("mdState", "STARTED") != "STARTED":
         return
     spinups = [e for e in f.host_events if e.kind == "spinup"]
     yield Finding(
