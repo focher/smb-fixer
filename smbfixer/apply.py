@@ -126,7 +126,13 @@ def plan(facts: Facts, recs: list[Recommendation], ssh: SSH | None) -> list[Chan
         old, new = files[report.NSMB_FILE]
         changes.append(Change("Mac", f"Rewrite {NSMB}", diff(old, new, NSMB), lambda new=new: write_nsmb(new),
                               [r for r in recs if r.target == report.CLIENT_NSMB]))
-    if report.EXTRA_FILE in files:
+    if report.EXTRA_FILE in files and not facts.unraid_version:
+        # Plain Samba never reads Unraid's smb-extra.conf; leave smb.conf to its owner.
+        _, new = files[report.EXTRA_FILE]
+        print("The server is not Unraid, so smbfixer will not edit its Samba config. Merge these "
+              "settings into smb.conf by hand, then run `testparm` and `smbcontrol smbd reload-config`:\n"
+              + "\n".join(f"    {line}" for line in new.splitlines()), file=sys.stderr)
+    elif report.EXTRA_FILE in files:
         old, new = files[report.EXTRA_FILE]
         if ssh is None:
             raise ApplyError("server changes need SSH access (host.address in smbfixer.toml)")

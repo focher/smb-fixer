@@ -63,6 +63,15 @@ def test_plan_matches_report_file():
     assert "+socket options" not in server.preview  # pinned buffers removed, not replaced
 
 
+def test_plan_leaves_plain_samba_config_alone(capsys):
+    facts, findings = analyze(unraid_snapshot())
+    facts.unraid_version = ""
+    recs = [r for r in report.all_recs(findings) if r.automatic and not r.tradeoff]
+    changes = ap.plan(facts, recs, ssh=None)
+    assert not any(c.machine == "Unraid server" for c in changes)
+    assert "not Unraid" in capsys.readouterr().err
+
+
 class LocalSSH:
     """Runs 'remote' scripts locally against fake testparm/smbcontrol binaries."""
 
