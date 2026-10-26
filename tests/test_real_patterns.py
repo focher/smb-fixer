@@ -94,8 +94,11 @@ def test_real_patterns():
     assert any("server disconnects" in e and "session gave up" in e for e in ep.evidence)
     assert "set up at 2026-10-23 10:50:15" in ep.evidence[-1]
 
-    assert ":52 past the hour" in f["logs.periodic"].title
-    assert "Time Machine" in f["logs.periodic"].detail
+    # the hourly closes after Time Machine are idle sessions, not trouble
+    idle = f["logs.idle_closes"]
+    assert idle.severity == "info" and "2 idle" in idle.title and "Time Machine" in idle.detail
+    assert "logs.periodic" not in f
+    assert len(facts.episodes) == 1  # only the 10:48 lockup
 
     assert "client.access_denied" in f
     assert "performance.mc_server_speed" in f

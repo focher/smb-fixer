@@ -12,7 +12,8 @@ for d in /sys/class/net/*; do
   n=${d##*/}
   m=$(readlink "$d/master" 2>/dev/null); m=${m##*/}
   phys=no; [ -e "$d/device" ] && phys=yes
-  echo "$n|$(cat $d/mtu 2>/dev/null)|$(cat $d/speed 2>/dev/null)|$(cat $d/duplex 2>/dev/null)|$(cat $d/operstate 2>/dev/null)|${m:--}|$phys"
+  l=$(ls -d "$d"/lower_* 2>/dev/null | head -1); l=${l##*/lower_}
+  echo "$n|$(cat $d/mtu 2>/dev/null)|$(cat $d/speed 2>/dev/null)|$(cat $d/duplex 2>/dev/null)|$(cat $d/operstate 2>/dev/null)|${m:--}|$phys|${l:--}"
 done
 """
 
@@ -54,13 +55,19 @@ def jobs(cfg: Config, ssh: SSH) -> list:
         r("disks_ini", "cat /var/local/emhttp/disks.ini 2>/dev/null"),
         r("user_shares", USER_SHARES_SCRIPT),
         r("net", NET_SCRIPT),
-        r("ip_link", "ip -j -s link"),
-        r("route_to_client", 'c=${SSH_CONNECTION%% *}; echo "$c"; ip -j route get "$c"'),
+        r("ip_link", "ip -d -j -s link"),
+        # Route the host actually uses to answer this client from the address the client connected to.
+        r("route_to_client", 'set -- $SSH_CONNECTION; echo "$1"; ip -j route get "$1" from "$3" 2>/dev/null '
+                             '|| ip -j route get "$1"'),
+        r("routes", "ip -j -4 route show"),
+        r("addrs", "ip -j -4 addr show"),
         r("ethtool", ETHTOOL_SCRIPT),
         r("load", "nproc; cat /proc/loadavg; free -m"),
         r("vmstat", "vmstat 1 5", timeout=30),
         r("df", "df -Pk"),
         r("date", "date '+%s %z'"),
+        r("uptime", "cat /proc/uptime"),
+        r("array", "grep -E '^(mdState|fsState|mdResync|mdResyncPos|mdResyncAction)=' /var/local/emhttp/var.ini"),
         r("sysctl_net", "sysctl net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem"),
         r("iperf3", "command -v iperf3"),
         r("samba_log", f"tail -n {n} /var/log/samba/log.smbd 2>/dev/null"),

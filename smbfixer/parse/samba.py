@@ -76,9 +76,11 @@ def net(text: str) -> dict[str, dict]:
     out = {}
     for line in text.splitlines():
         parts = line.strip().split("|")
-        if len(parts) != 7:
+        if len(parts) == 7:  # snapshots taken before the lower-device column existed
+            parts.append("-")
+        if len(parts) != 8:
             continue
-        name, mtu, speed, duplex, state, master, phys = parts
+        name, mtu, speed, duplex, state, master, phys, lower = parts
 
         def num(v):
             try:
@@ -94,20 +96,43 @@ def net(text: str) -> dict[str, dict]:
             "state": state,
             "master": None if master == "-" else master,
             "physical": phys == "yes",
+            "lower": None if lower == "-" else lower,
         }
     return out
 
 
-def physical_members(ifaces: dict[str, dict], name: str) -> list[str]:
-    """Resolve a bridge/bond (br0 -> bond0 -> eth0) down to physical NICs."""
-    if name not in ifaces:
+_STACKED = re.compile(r"^(?:shim-(?P<shim>.+)|(?P<base>.+?)\.(?:macvlan|ipvlan)\d*)$")
+
+
+def is_shim_name(name: str) -> bool:
+    return bool(_STACKED.match(name))
+
+
+def parent_device(ifaces: dict[str, dict], name: str) -> str | None:
+    """The device a macvlan/ipvlan/vlan sub-interface sits on (br0.macvlan0 -> br0, shim-br0 -> br0)."""
+    info = ifaces.get(name, {})
+    if info.get("lower"):
+        return info["lower"]
+    m = _STACKED.match(name)
+    if m:
+        parent = m.group("shim") or m.group("base")
+        return parent if parent in ifaces else None
+    return None
+
+
+def physical_members(ifaces: dict[str, dict], name: str, _seen: frozenset = frozenset()) -> list[str]:
+    """Resolve a bridge/bond/macvlan (br0.macvlan0 -> br0 -> bond0 -> eth0) down to physical NICs."""
+    if name not in ifaces or name in _seen:
         return []
+    _seen = _seen | {name}
     if ifaces[name]["physical"]:
         return [name]
     members = []
     for child, info in ifaces.items():
         if info["master"] == name:
-            members += physical_members(ifaces, child)
+            members += physical_members(ifaces, child, _seen)
+    if not members and (parent := parent_device(ifaces, name)):
+        members = physical_members(ifaces, parent, _seen)
     return members
 
 
@@ -123,7 +148,32 @@ def ip_link_stats(text: str) -> dict[str, dict]:
             "rx": stats.get("rx", {}),
             "tx": stats.get("tx", {}),
             "mtu": link.get("mtu"),
+            "parent": link.get("link"),
+            "kind": (link.get("linkinfo") or {}).get("info_kind"),
+            "tx_queues": link.get("num_tx_queues"),
         }
+    return out
+
+
+def routes(text: str) -> list[dict]:
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    return [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+
+
+def addrs(text: str) -> dict[str, list[str]]:
+    """ip -j addr -> {address: [interfaces holding it]}."""
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    out: dict[str, list[str]] = {}
+    for link in data if isinstance(data, list) else []:
+        for a in link.get("addr_info", []):
+            if a.get("local"):
+                out.setdefault(a["local"], []).append(link.get("ifname", "?"))
     return out
 
 
@@ -136,7 +186,7 @@ def route_to_client(text: str) -> dict:
         routes = json.loads("\n".join(lines[1:]))
         if routes:
             out["dev"] = routes[0].get("dev")
-            out["src"] = routes[0].get("prefsrc")
+            out["src"] = routes[0].get("prefsrc") or routes[0].get("from")
             out["gateway"] = routes[0].get("gateway")
     except (json.JSONDecodeError, ValueError):
         pass

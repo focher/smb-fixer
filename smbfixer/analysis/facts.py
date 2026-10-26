@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from smbfixer.analysis import logs
 from smbfixer.parse import macos as pm
@@ -41,7 +41,8 @@ class Facts:
     client_events: list = field(default_factory=list)
     client_epoch: int | None = None
     client_tz: timedelta | None = None
-    episodes: list = field(default_factory=list)
+    episodes: list = field(default_factory=list)  # real trouble; idle closes are kept apart
+    idle_closes: list = field(default_factory=list)
     loops: list = field(default_factory=list)
 
     # host
@@ -59,6 +60,8 @@ class Facts:
     host_ifaces: dict[str, dict] = field(default_factory=dict)
     host_route: dict = field(default_factory=dict)
     host_phys: list[str] = field(default_factory=list)
+    host_routes: list[dict] = field(default_factory=list)
+    host_addrs: dict[str, list[str]] = field(default_factory=dict)
     link_stats: dict[str, dict] = field(default_factory=dict)
     ethtool: dict[str, dict] = field(default_factory=dict)
     load: dict = field(default_factory=dict)
@@ -70,6 +73,8 @@ class Facts:
     host_epoch: int | None = None
     host_tz: timedelta | None = None
     iperf3_on_host: bool = False
+    array: dict[str, str] = field(default_factory=dict)
+    host_boot: datetime | None = None  # on the client's wall clock
 
     # derived
     clock_skew: float | None = None  # host - client, seconds
@@ -170,7 +175,9 @@ def build_facts(snap: Snapshot) -> Facts:
         f.ds_store_disabled = snap.out("client", "ds_store").strip() in {"1", "true", "YES"}
         f.client_epoch, f.client_tz = _tz(snap.out("client", "date"))
         f.client_events = logs.classify_client(pm.unified_log(snap.out("client", "smb_log")))
-        f.episodes = logs.episodes(f.client_events)
+        all_eps = logs.episodes(f.client_events)
+        f.episodes = [e for e in all_eps if not e.idle]
+        f.idle_closes = [e for e in all_eps if e.idle]
         f.loops = logs.reconnect_loops(f.client_events)
 
     # ---------------- host ----------------
@@ -187,9 +194,18 @@ def build_facts(snap: Snapshot) -> Facts:
         f.disks = ps.disks_ini(snap.out("host", "disks_ini"))
         f.user_shares = ps.user_shares(snap.out("host", "user_shares"))
         f.host_ifaces = ps.net(snap.out("host", "net"))
+        f.link_stats = ps.ip_link_stats(snap.out("host", "ip_link"))
+        for name, st in f.link_stats.items():
+            info = f.host_ifaces.get(name)
+            if info is not None:
+                info["kind"] = st.get("kind")
+                info["tx_queues"] = st.get("tx_queues")
+                if not info.get("lower") and st.get("parent") and not info.get("master"):
+                    info["lower"] = st["parent"]
         f.host_route = ps.route_to_client(snap.out("host", "route_to_client"))
         f.host_phys = ps.physical_members(f.host_ifaces, f.host_route.get("dev") or "")
-        f.link_stats = ps.ip_link_stats(snap.out("host", "ip_link"))
+        f.host_routes = ps.routes(snap.out("host", "routes"))
+        f.host_addrs = ps.addrs(snap.out("host", "addrs"))
         f.ethtool = ps.ethtool(snap.out("host", "ethtool"))
         f.load = ps.load(snap.out("host", "load"))
         f.vmstat = ps.vmstat(snap.out("host", "vmstat"))
@@ -201,8 +217,17 @@ def build_facts(snap: Snapshot) -> Facts:
         f.iperf3_on_host = snap.ok("host", "iperf3")
         f.host_epoch, f.host_tz = _tz(snap.out("host", "date"))
 
+        f.array = ps.unraid_cfg(snap.out("host", "array"))
         if f.client_epoch is not None and f.host_epoch is not None:
             f.clock_skew = float(f.host_epoch - f.client_epoch)
+        up = snap.out("host", "uptime").split()
+        if up and f.host_epoch is not None and f.client_tz is not None:
+            try:
+                boot_utc = datetime.fromtimestamp(f.host_epoch - float(up[0]) - (f.clock_skew or 0.0), timezone.utc)
+                boot_utc = boot_utc.replace(tzinfo=None)
+                f.host_boot = boot_utc + f.client_tz
+            except (ValueError, OverflowError):
+                pass
         year = datetime.fromtimestamp(snap.created_at).year
         host_events = logs.classify_samba(ps.samba_log(snap.out("host", "samba_log")))
         host_events += logs.classify_syslog(ps.syslog(snap.out("host", "syslog"), year))

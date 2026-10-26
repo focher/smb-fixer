@@ -42,7 +42,8 @@ SAMBA_PATTERNS = [
 SYSLOG_PATTERNS = [
     ("spinup", re.compile(r"read SMART /dev/|spinning up|spin(?:ning)?[ -]up", re.I)),
     ("spindown", re.compile(r"spinning down|spin(?:ning)?[ -]down", re.I)),
-    ("nic", re.compile(r"Link is Down|NIC Link is|link down|tx timeout|Reset adapter|NETDEV WATCHDOG|"
+    # "Link is Up" alone is normal at boot; only downs and resets indicate trouble.
+    ("nic", re.compile(r"Link is Down|link down|tx timeout|Reset adapter|NETDEV WATCHDOG|"
                        r"transmit queue \d+ timed out|link becomes not ready", re.I)),
     ("io_error", re.compile(r"I/O error|blk_update_request|critical medium error|"
                             r"ata\d+(?:\.\d+)?: (?:exception|failed command|hard resetting|COMRESET)", re.I)),
@@ -103,6 +104,11 @@ class Episode:
     @property
     def kinds(self) -> dict[str, int]:
         return counts(self.events)
+
+    @property
+    def idle(self) -> bool:
+        """A lone server-side close with no stall or failed I/O: the server dropping an idle session."""
+        return self.kinds == {"disconnect": 1}
 
     @property
     def sessions(self) -> list[str]:
@@ -166,6 +172,8 @@ def correlate(client_events, host_events, window: timedelta = timedelta(seconds=
     causes = [e for e in host_events if e.kind in CAUSES and e.when]
     out = []
     for ep in episodes(client_events):
+        if ep.idle:
+            continue
         near = [he for he in causes if ep.start - window <= he.when <= ep.end + timedelta(seconds=15)]
         if near:
             out.append(Correlation(ep.events[0], near, ep))
