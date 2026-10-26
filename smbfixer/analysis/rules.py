@@ -546,6 +546,20 @@ def time_machine(f: Facts):
                    tradeoff="posix locking/kernel share modes = no hide SMB locks from local Linux processes "
                             "and NFS; fine for a share used only by Time Machine." if k != "durable handles" else "")
              for k, v in params.items()]
+    last = max(e.when for e in durable if e.when) if any(e.when for e in durable) else None
+    if f.smbconf and tm_share and not params and (f.host_boot is None or (last and last < f.host_boot)):
+        # The config is right now; the refusals in the log are from before it was applied.
+        yield Finding(
+            "client.time_machine_durable", "info", "client",
+            "Time Machine share now allows durable handles",
+            f"[{tm_share}] meets every prerequisite. The {len(durable)} refusal(s) in the log predate the "
+            + (f"server restart at {f.host_boot:%H:%M}" if f.host_boot else "change")
+            + "; the next backup should no longer log 'Durable Handle V2 ... not supported'.",
+            [f"last refusal {last:%Y-%m-%d %H:%M}" if last else "refusals logged earlier",
+             *[f"[{tm_share}] {k} ok" for k in ("durable handles", "kernel oplocks", "kernel share modes",
+                                                 "posix locking")]],
+        )
+        return
     yield Finding(
         "client.time_machine_durable", "warning", "client",
         "Time Machine backs up over SMB without durable handles",
