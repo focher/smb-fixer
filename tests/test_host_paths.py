@@ -144,3 +144,19 @@ def test_stopped_array_and_restart_explain_the_outage():
     assert ep.severity == "warning" and "explained by the server restart" in ep.title
     assert "logs.host_critical" not in f  # "Link is Up" at boot is not a fault
     assert "storage.spindown" not in f
+
+
+def test_time_machine_fixed_before_restart_is_info():
+    from tests.test_real_patterns import snapshot as tm_snapshot
+    snap = tm_snapshot()
+    full = unraid_snapshot()
+    snap.host = full.host
+    snap.host["testparm"].stdout += ("\n[tm]\n\tpath = /mnt/user/tm\n\tfruit:time machine = yes\n"
+                                     "\tdurable handles = Yes\n\tkernel share modes = No\n\tposix locking = No\n")
+    snap.host["uptime"] = result("uptime", "600.00 1.00\n")  # booted after the 08:46/09:46 refusals
+    tm = by_id(analyze(snap)[1])["client.time_machine_durable"]
+    assert tm.severity == "info" and "now allows durable handles" in tm.title
+
+    snap.host["testparm"].stdout = snap.host["testparm"].stdout.replace("\tposix locking = No\n", "")
+    tm = by_id(analyze(snap)[1])["client.time_machine_durable"]
+    assert tm.severity == "warning" and [r.action for r in tm.recommendations] == ["posix locking = no"]
