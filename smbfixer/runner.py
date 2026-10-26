@@ -32,10 +32,10 @@ class Result:
         return cls(**data)
 
 
-def run_local(name: str, argv: list[str], timeout: float = 60.0) -> Result:
+def run_local(name: str, argv: list[str], timeout: float = 60.0, input: str | None = None) -> Result:
     start = time.monotonic()
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, errors="replace")
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, errors="replace", input=input)
         rc, out, err = proc.returncode, proc.stdout, proc.stderr
     except FileNotFoundError as exc:
         rc, out, err = 127, "", str(exc)
@@ -70,10 +70,10 @@ class SSH:
         argv.append(f"{self.host.ssh_user}@{self.host.address}")
         return argv
 
-    def run(self, name: str, script: str, timeout: float = 60.0) -> Result:
+    def run(self, name: str, script: str, timeout: float = 60.0, input: str | None = None) -> Result:
         # The remote login shell on Unraid is bash; wrap so pipelines behave predictably.
         argv = self.base_argv() + ["bash", "-c", shlex.quote(script)]
-        result = run_local(name, argv, timeout=timeout)
+        result = run_local(name, argv, timeout=timeout, input=input)
         result.command = script
         return result
 

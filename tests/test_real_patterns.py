@@ -115,4 +115,4 @@ def test_signing_rule_uses_real_attribute_name():
     _, findings = analyze(snap)
     sig = by_id(findings)["client.signing"]
     assert any("AES_128_GMAC" in e for e in sig.evidence)
-    assert "signing_required=no" in report.snippets(*analyze(snap))["/etc/nsmb.conf (client)"]
+    assert "signing_required=no" in report.snippets(*analyze(snap))[report.NSMB_FILE]

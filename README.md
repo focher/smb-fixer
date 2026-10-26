@@ -5,8 +5,12 @@ Diagnose and tune SMB file sharing between a **macOS client** and a **Samba host
 negotiated connection parameters, network path, host storage layout — and explains *why* a share
 is slow or locks up, then proposes concrete configuration changes for each side.
 
-It is read-only by default: it never changes the Mac or the server. Every recommendation is printed
-with the reason for it and, where relevant, the tradeoff (for example, turning off packet signing).
+`check` is read-only: it never changes the Mac or the server. Every recommendation says **which
+machine** it is for, why, and — where relevant — the tradeoff (for example, turning off packet
+signing). `apply` then makes the changes the app can safely make itself, and lists the rest by machine.
+
+> **Where to run it:** everything below is typed in **Terminal on the Mac** (prompt ending in `%`),
+> not in the Unraid web terminal. The app reaches the server over SSH on its own.
 
 ## What it checks
 
@@ -21,9 +25,9 @@ with the reason for it and, where relevant, the tradeoff (for example, turning o
 | Live | `monitor` probes the mount for stalls while streaming both logs, then shows what happened around each stall |
 | Throughput | `bench` measures sequential and small-file performance on the mount, optionally against raw network (iperf3) and host disk speed |
 
-## Install
+## Install (on the Mac)
 
-Requires Python 3.11+ on the Mac. No third-party packages.
+Requires Python 3.11+. No third-party packages.
 
 ```bash
 git clone https://github.com/focher/smb-fixer.git
@@ -37,11 +41,14 @@ Or run it in place with `python3 -m smbfixer ...`.
 
 Host-side checks run over SSH with key authentication (no passwords are stored or prompted for).
 
-1. On the Mac: `ssh-keygen -t ed25519` (accept the defaults), then `cat ~/.ssh/id_ed25519.pub`.
-2. In the Unraid web UI: **Users > root > SSH authorized keys**, paste the key, **Apply**.
-3. Test: `ssh root@tower.local true`
+1. **On the Mac** (Terminal): `ssh-keygen -t ed25519` (accept the defaults), then
+   `pbcopy < ~/.ssh/id_ed25519.pub` to copy the public key.
+2. **In the Unraid web UI** (any browser): **Settings > Management Access > Use SSH: Yes**, then
+   **Users > root > SSH authorized keys**, paste the key, **Apply**.
+3. **On the Mac**: `ssh -o BatchMode=yes root@tower.local true` must return without asking for a
+   password. (Running this from the Unraid terminal instead fails with "Host key verification failed".)
 
-## Configure
+## Configure (on the Mac)
 
 ```bash
 smbfixer init        # writes ./smbfixer.toml
@@ -50,10 +57,12 @@ smbfixer init        # writes ./smbfixer.toml
 Edit `host.address` and `client.mount_point` (the share as mounted in Finder, e.g. `/Volumes/media`).
 Any setting can also be given on the command line: `--host`, `--user`, `--mount`.
 
-## Use
+## Use (on the Mac)
 
 ```bash
 smbfixer check                 # collect from both ends, analyse, recommend
+smbfixer apply                 # make the [auto] changes, asking before each one
+smbfixer apply --dry-run       # show exactly what apply would change
 smbfixer check --no-host       # client-side only (no SSH needed)
 smbfixer check -f md > report.md
 smbfixer monitor               # watch live; reproduce the problem, then Ctrl-C
@@ -72,20 +81,49 @@ Exit status is `2` when a critical finding (or, for `monitor`, a stall) was seen
 - `bench` writes a temporary file and a temporary folder of small files on the mount and deletes them.
 - `bench --host-disk` writes a temporary file inside the share's path on the host and deletes it.
 - `monitor --samba-debug N` changes the running smbd debug level and restores it on exit.
+- `apply` makes the changes described below, and only after you confirm them.
 
 Nothing else writes to either machine.
 
 ## Applying recommendations
 
-The report ends with merged snippets:
+Every step in the report is tagged with where it happens and how:
 
-- **`/etc/nsmb.conf` (client)** — replace the file's contents with the snippet
-  (`sudo nano /etc/nsmb.conf`), then unmount and remount the share.
-- **`/boot/config/smb-extra.conf` (host)** — the same file as Unraid's *Settings > SMB > SMB Extras*.
-  Paste the snippet there and click Apply, or edit the file and run `smbcontrol smbd reload-config`.
-- **Unraid web UI** steps are listed by menu path.
+| Tag | Meaning |
+| --- | --- |
+| `[auto]` | `smbfixer apply` can make this change itself |
+| `[you]` | must be done by hand, at the place shown |
+| `[check]` | a command that only looks; it changes nothing |
 
-Change one thing at a time and re-run `smbfixer check` (or `bench`) to confirm the effect.
+The report ends with **What to do, by machine**:
+
+**On this Mac** — `[auto]`
+- `/etc/nsmb.conf` (SMB client settings). `apply` backs up the file to
+  `/etc/nsmb.conf.smbfixer-<time>`, writes the new one with `sudo` (it asks for your Mac password),
+  and checks the result. Unmount and remount the share (or restart the Mac) for it to take effect.
+- Simple settings such as `defaults write com.apple.desktopservices DSDontWriteNetworkStores`.
+
+**On the Unraid server** — `[auto]`
+- `/boot/config/smb-extra.conf`, the same text as **Settings > SMB > SMB Extras** in the web UI.
+  `apply` copies the old file to `/boot/config/smb-extra.conf.smbfixer-<time>`, writes the new one over
+  SSH, validates the complete Samba configuration with `testparm`, **restores the backup if the check
+  fails**, and otherwise reloads Samba with `smbcontrol smbd reload-config`. Settings that affect the
+  connection itself (socket options, interfaces) apply to new connections, so reconnect the share.
+
+**In the Unraid web UI** — `[you]`
+- Steps are listed by menu path (for example *Settings > Docker > Docker custom network type*).
+  These stay manual because Unraid applies them through its own services, and some require stopping
+  Docker or the array.
+
+**On the network** — `[you]`
+- Cables, switch ports, jumbo frames and Wi‑Fi placement.
+
+Changes marked as a **tradeoff** (turning off packet signing, `strict sync = no`, …) are never made
+silently: `apply` asks about each one, and `apply --yes` skips them unless you also pass
+`--include-tradeoffs`.
+
+Change one thing at a time and re-run `smbfixer check` (or `bench`) to confirm the effect. To undo a
+file change, copy the `.smbfixer-<time>` backup back over the file.
 
 ## Development
 

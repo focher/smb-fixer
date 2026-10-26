@@ -63,20 +63,22 @@ def test_severity_ordering():
 def test_snippets_merge_into_sections():
     facts, findings = analyze(troubled_snapshot())
     snip = report.snippets(facts, findings)
-    client = snip["/etc/nsmb.conf (client)"]
+    client = snip[report.NSMB_FILE]
     assert client.startswith("[default]")
     assert "signing_required=no" in client and "mc_prefer_wired=yes" in client
-    host = snip["/boot/config/smb-extra.conf (host)"]
+    host = snip[report.EXTRA_FILE]
     assert "[global]" in host and "fruit:metadata = stream" in host
     assert "socket options = TCP_NODELAY" in host
 
 
 def test_renderers_run():
     facts, findings = analyze(troubled_snapshot())
-    assert "Proposed configuration" in report.text(facts, findings, color=False)
+    out = report.text(facts, findings, color=False)
+    assert "What to do, by machine" in out and "On this Mac" in out and "On the Unraid server" in out
+    assert "[auto] Replace /etc/nsmb.conf with:" in out and "[you]" in out
     assert report.markdown(facts, findings).startswith("# SMB Fixer report")
     data = json.loads(report.as_json(facts, findings))
-    assert data["findings"] and data["snippets"]
+    assert data["findings"] and data["files"]
 
 
 def test_snapshot_round_trip(tmp_path):

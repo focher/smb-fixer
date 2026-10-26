@@ -96,7 +96,7 @@ def test_legacy_tweaks_are_removed_from_snippet():
     oplocks = f["host.oplocks"]
     assert {r.remove_key for r in oplocks.recommendations} == {"oplocks", "level2 oplocks"}
     assert "no SMB2 leases" in oplocks.detail
-    snippet = report.snippets(facts, findings)["/boot/config/smb-extra.conf (host)"]
+    snippet = report.snippets(facts, findings)[report.EXTRA_FILE]
     for gone in ("ea support", "oplocks", "SO_RCVBUF", "netatalk", "wipe_abe"):
         assert gone not in snippet, gone
     assert "fruit:copyfile = yes" in snippet  # good lines survive

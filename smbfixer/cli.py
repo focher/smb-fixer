@@ -49,6 +49,15 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--samba-debug", type=int, metavar="N",
                    help="temporarily raise smbd debug level on the host (restored on exit)")
 
+    ap = sub.add_parser("apply", help="make the [auto] changes from the report on the Mac and the server")
+    ap.add_argument("--dry-run", action="store_true", help="show what would change and stop")
+    ap.add_argument("-y", "--yes", action="store_true",
+                    help="apply without asking (tradeoff changes are still skipped unless --include-tradeoffs)")
+    ap.add_argument("--include-tradeoffs", action="store_true",
+                    help="also apply changes that trade safety or compatibility for speed")
+    ap.add_argument("--no-host", action="store_true", help="only change the Mac")
+    ap.add_argument("--no-client", action="store_true", help="only change the server")
+
     b = sub.add_parser("bench", help="measure SMB throughput and small-file latency")
     b.add_argument("--size", type=int, help="sequential test size in MB")
     b.add_argument("--files", type=int, help="number of small files")
@@ -194,8 +203,80 @@ def cmd_init(args, cfg) -> int:
     return 0
 
 
+def ask(prompt: str) -> bool:
+    try:
+        return input(prompt).strip().lower() in {"y", "yes"}
+    except EOFError:
+        return False
+
+
+def cmd_apply(args, cfg) -> int:
+    from smbfixer import apply as apply_mod
+
+    if not args.no_host:
+        require_host(cfg)
+    print("collecting current state...", file=sys.stderr)
+    snap = collect(cfg, client=not args.no_client, host=not args.no_host)
+    facts, findings = analyze(snap)
+    recs = report.all_recs(findings)
+    if args.no_host:
+        recs = [r for r in recs if r.side != "host"]
+    if args.no_client:
+        recs = [r for r in recs if r.side != "client"]
+    interactive = sys.stdin.isatty() and not args.yes and not args.dry_run
+    chosen = apply_mod.choose(recs, include_tradeoffs=args.include_tradeoffs, interactive=interactive, ask=ask)
+    skipped = [r for r in recs if r.automatic and r not in chosen]
+    ssh = SSH(cfg.host) if cfg.host.address and not args.no_host else None
+    try:
+        changes = apply_mod.plan(facts, chosen, ssh)
+    except apply_mod.ApplyError as exc:
+        sys.exit(str(exc))
+
+    if not changes:
+        print("Nothing for smbfixer to change automatically.")
+    for i, ch in enumerate(changes, 1):
+        print(f"\n[{i}/{len(changes)}] {ch.machine}: {ch.title}")
+        print("\n".join(f"    {line}" for line in ch.preview.splitlines()))
+    if skipped:
+        print("\nSkipped (tradeoffs, not chosen):")
+        print("\n".join(f"  - {r.machine}: {r.action}" for r in skipped))
+    if args.dry_run or not changes:
+        _print_manual(recs)
+        return 0
+    if not args.yes and not sys.stdin.isatty():
+        sys.exit("not a terminal: re-run with --yes to apply without prompts")
+
+    failed = 0
+    for ch in changes:
+        if not args.yes and not ask(f"\nApply '{ch.title}' on the {ch.machine}? [y/N] "):
+            print("  skipped")
+            continue
+        try:
+            print(f"  {ch.run()}")
+        except apply_mod.ApplyError as exc:
+            failed += 1
+            print(f"  FAILED: {exc}", file=sys.stderr)
+    _print_manual(recs)
+    print("\nRun `smbfixer check` to confirm the result.")
+    return 1 if failed else 0
+
+
+def _print_manual(recs) -> None:
+    from smbfixer.analysis.model import MACHINE_HEADINGS
+
+    groups = report.by_machine([r for r in recs if not r.automatic])
+    if not any(groups.values()):
+        return
+    print("\nStill to do by hand:")
+    for machine, heading in MACHINE_HEADINGS.items():
+        items = groups.get(machine, [])
+        if items:
+            print(f"  {heading}")
+            print("\n".join(f"    [{report.tag(r)}] {r.action}" for r in items))
+
+
 COMMANDS = {
-    "init": cmd_init, "check": cmd_check, "collect": cmd_collect,
+    "init": cmd_init, "check": cmd_check, "collect": cmd_collect, "apply": cmd_apply,
     "analyze": cmd_analyze, "monitor": cmd_monitor, "bench": cmd_bench,
 }
 

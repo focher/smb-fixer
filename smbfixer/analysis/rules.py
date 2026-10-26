@@ -179,7 +179,7 @@ def host_shim_route(f: Facts):
                         tradeoff="The server and containers with their own IPs can no longer reach each other "
                                  "directly."),
          Recommendation(HOST_SHELL, f"ip route get {f.host_route.get('client_ip')} from {host_ip}",
-                        f"After the change this should show dev {parent or 'br0'}.")],
+                        f"After the change this should show dev {parent or 'br0'}.", check=True)],
     )
 
 
@@ -400,6 +400,8 @@ def ds_store(f: Facts):
             ["DSDontWriteNetworkStores not set"],
             [Recommendation(CLIENT_SHELL, "defaults write com.apple.desktopservices DSDontWriteNetworkStores -bool true",
                             "Stop Finder writing view metadata to shares (log out/in to apply).",
+                            command=["defaults", "write", "com.apple.desktopservices",
+                                     "DSDontWriteNetworkStores", "-bool", "true"],
                             tradeoff="Finder view settings for network folders will no longer be remembered.")],
         )
 
@@ -412,8 +414,8 @@ def nsmb_malformed(f: Facts):
             "These lines look like pasted shell commands rather than settings, so whatever they were meant to set "
             "is not in effect. Replace the file with plain key=value lines under [default].",
             [f"{path}: {line}" for line in bad[:6]],
-            [Recommendation(CLIENT_SHELL, "sudo nano /etc/nsmb.conf   # keep only [default] and key=value lines",
-                            "The merged file to use is in the Proposed configuration section below.")],
+            [Recommendation(CLIENT_NSMB, "delete the lines that are not settings",
+                            "Leaves only [default] and key=value lines.", section="default", drop_lines=bad)],
         )
 
 
@@ -520,7 +522,7 @@ def reconnect_loop(f: Facts):
             [f"session {loop.session}: {loop.attempts} retries", f"current channel ids: "
              f"{', '.join(sorted(f.all_channel_ids)) or 'none'}"],
             [Recommendation(CLIENT_SHELL, "mount -t smbfs; smbutil statshares -a",
-                            "Find the stale volume; then `diskutil unmount force /Volumes/<name>`."),
+                            "Find the stale volume; then `diskutil unmount force /Volumes/<name>`.", check=True),
              Recommendation(CLIENT_SHELL, "If nothing stale is listed, restart the Mac",
                             "Orphaned kernel sessions are only cleared by a reboot.")],
         )
@@ -918,7 +920,8 @@ def host_resources(f: Facts):
             "host.log_full", "warning", "host", f"/var/log is {log_fs['used_pct']}% full",
             "On Unraid /var/log is a small RAM disk; once full, logging stops and some services misbehave.",
             [f"/var/log {log_fs['used_pct']}% used"],
-            [Recommendation(HOST_SHELL, "du -sh /var/log/* | sort -h | tail", "Find what is filling the log.")],
+            [Recommendation(HOST_SHELL, "du -sh /var/log/* | sort -h | tail", "Find what is filling the log.",
+                                           check=True)],
         )
 
 
