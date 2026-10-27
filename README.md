@@ -391,3 +391,7 @@ tested without either machine.
 
 Bug reports are most useful with the output of `smbfixer check -v` (after removing anything private)
 or the snapshot file from `./reports/`.
+
+## License
+
+[MIT](LICENSE)
